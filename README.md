@@ -49,11 +49,23 @@ npm run dev      # run with dev tools open
 ### Build Portable
 
 ```bash
-npm run build          # pack Electron app to dist/
-npm run build:portable # pack + create portable .zip
+npm run build          # pack Windows x64 app to dist/
+npm run build:win      # same (explicit Windows)
+npm run build:mac      # pack macOS x64 app
+npm run build:linux    # pack Linux x64 app
+npm run build:all      # pack for all platforms
+npm run build:portable # pack Windows + create portable .zip
 ```
 
-Output in `dist/VidSaver-win32-x64/` — run `VidSaver.exe` directly.
+Output per platform:
+- `dist/VidSaver-win32-x64/VidSaver.exe` — Windows
+- `dist/VidSaver-darwin-x64/VidSaver.app` — macOS
+- `dist/VidSaver-linux-x64/vidsaver` — Linux
+
+Notes:
+- macOS build uses `.png` icon (app will use default Electron icon; replace with `.icns` for a custom one)
+- Linux build requires `libnss3`, `libatk-1.0-0` and other typical Electron dependencies — install them via your package manager
+- The `build:portable` script (Windows-only) creates a `.zip` for distribution
 
 ## Tech Stack
 
