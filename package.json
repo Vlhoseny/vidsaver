@@ -1,0 +1,20 @@
+{
+  "name": "vidsaver",
+  "version": "1.1.0",
+  "description": "Download YouTube playlists and videos with ease",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=win32 --arch=x64 --out=dist --overwrite",
+    "build:portable": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=win32 --arch=x64 --out=dist --overwrite && powershell -Command \"Compress-Archive -Path 'dist\\VidSaver-win32-x64\\*' -DestinationPath 'dist\\VidSaver-1.1.0-portable.zip' -Force\""
+  },
+  "author": "VidSaver",
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.0.1",
+    "electron": "^33.0.0"
+  }
+}
