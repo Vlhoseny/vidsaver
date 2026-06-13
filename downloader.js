@@ -141,8 +141,11 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
     if (type === 'mp3') {
       args.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', preset.quality || '0')
     }
+    if (type === 'mp4') {
+      args.push('--merge-output-format', 'mp4', '--remux-video', 'mp4')
+    }
     if (type === 'mkv') {
-      args.push('--merge-output-format', 'mkv')
+      args.push('--merge-output-format', 'mkv', '--remux-video', 'mkv')
     }
     args.push('--ffmpeg-location', getFfmpegPath())
     args.push(url)

@@ -25,10 +25,10 @@ function getFormatString(type, preset) {
 
   const heights = [2160, 1440, 1080, 720, 480, 360]
   const idx = heights.indexOf(preset.height)
-  if (idx === -1) return `bestvideo[height<=1080][vcodec*=avc1]+bestaudio/best[height<=1080]`
+  if (idx === -1) return `bestvideo[height<=1080][vcodec*=avc1]+bestaudio[acodec*=mp4a]/best[height<=1080]`
 
   const options = heights.slice(idx).map(h =>
-    `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio`
+    `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio[acodec*=mp4a]`
   )
   options.push('best[height<=2160]')
   return options.join('/')
