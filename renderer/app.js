@@ -136,11 +136,11 @@ themeBtn.addEventListener('click', () => {
 })
 
 feedbackBtn.addEventListener('click', () => {
-  window.api.openUrl('https://github.com/vidsaver/vidsaver/issues/new?template=feature_request.md')
+  window.api.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new?template=feature_request.md')
 })
 
 bugBtn.addEventListener('click', () => {
-  window.api.openUrl('https://github.com/vidsaver/vidsaver/issues/new?template=bug_report.md')
+  window.api.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new')
 })
 
 // --- Presets ---
