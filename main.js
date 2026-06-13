@@ -1,10 +1,23 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage } = require('electron')
+const { app, BrowserWindow, Tray, Menu, nativeImage, dialog } = require('electron')
 const path = require('path')
+const { spawnSync } = require('child_process')
 const { registerIpcHandlers } = require('./ipc')
 const config = require('./config')
 
 let mainWindow
 let tray = null
+
+function checkYtDlp() {
+  const result = spawnSync('yt-dlp', ['--version'], { windowsHide: true, encoding: 'utf8' })
+  if (result.error || result.status !== 0) {
+    dialog.showErrorBox('Missing yt-dlp',
+      'yt-dlp was not found on your system PATH.\n\n' +
+      'Install it with: pip install yt-dlp\n\n' +
+      'Then restart VidSaver.')
+    return false
+  }
+  return true
+}
 
 function createWindow() {
   config.load()
@@ -69,6 +82,7 @@ function createTray() {
 }
 
 app.whenReady().then(() => {
+  if (!checkYtDlp()) return
   createWindow()
   createTray()
 })

@@ -6,8 +6,20 @@ let downloadIdCounter = 0
 
 function getFfmpegPath() {
   try {
+    const fs = require('fs')
     const ffmpeg = require('@ffmpeg-installer/ffmpeg')
-    if (ffmpeg.path && require('fs').existsSync(ffmpeg.path)) return ffmpeg.path
+    if (ffmpeg.path && fs.existsSync(ffmpeg.path)) {
+      if (ffmpeg.path.includes('.asar')) {
+        const { app } = require('electron')
+        const dest = path.join(app.getPath('userData'), 'bin', 'ffmpeg.exe')
+        if (!fs.existsSync(dest)) {
+          fs.mkdirSync(path.dirname(dest), { recursive: true })
+          fs.copyFileSync(ffmpeg.path, dest)
+        }
+        return dest
+      }
+      return ffmpeg.path
+    }
     return 'ffmpeg'
   } catch {
     return 'ffmpeg'
