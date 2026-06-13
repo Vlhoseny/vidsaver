@@ -14,7 +14,7 @@ function createWindow() {
     minWidth: 700,
     minHeight: 500,
     title: 'VidSaver - YouTube Downloader',
-    icon: path.join(__dirname, 'renderer', 'icon.svg'),
+    icon: path.join(__dirname, 'renderer', 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
