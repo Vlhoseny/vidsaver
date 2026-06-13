@@ -8,12 +8,7 @@ const QUALITY_PRESETS = {
     { label: '360p', height: 360 },
   ],
   mkv: [
-    { label: '2160p (4K)', height: 2160 },
-    { label: '1440p (2K)', height: 1440 },
-    { label: '1080p (Full HD)', height: 1080 },
-    { label: '720p (HD)', height: 720 },
-    { label: '480p (SD)', height: 480 },
-    { label: '360p', height: 360 },
+    { label: 'Best Available', height: 2160 },
   ],
   mp3: [
     { label: 'Best (320kbps)', quality: '0' },
@@ -24,11 +19,19 @@ const QUALITY_PRESETS = {
 
 function getFormatString(type, preset) {
   if (type === 'mp3') return 'bestaudio/best'
-  const h = preset.height
   if (type === 'mkv') {
-    return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`
+    return 'bestvideo+bestaudio/best'
   }
-  return `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio/best[height<=${h}]`
+
+  const heights = [2160, 1440, 1080, 720, 480, 360]
+  const idx = heights.indexOf(preset.height)
+  if (idx === -1) return `bestvideo[height<=1080][vcodec*=avc1]+bestaudio/best[height<=1080]`
+
+  const options = heights.slice(idx).map(h =>
+    `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio`
+  )
+  options.push('best[height<=2160]')
+  return options.join('/')
 }
 
 function estimateSize(formats, type, preset) {
@@ -41,9 +44,16 @@ function estimateSize(formats, type, preset) {
     return audio?.filesize || audio?.filesize_approx || null
   }
 
-  const height = preset.height
+  let maxHeight = preset.height
+  if (type === 'mkv') {
+    const best = formats
+      .filter(f => f.vcodec !== 'none' && f.height)
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0]
+    maxHeight = best?.height || 2160
+  }
+
   const video = formats
-    .filter(f => f.vcodec !== 'none' && f.height && f.height <= height && f.acodec === 'none')
+    .filter(f => f.vcodec !== 'none' && f.height && f.height <= maxHeight && f.acodec === 'none')
     .sort((a, b) => (b.height || 0) - (a.height || 0))[0]
   const audio = formats
     .filter(f => f.vcodec === 'none' && f.abr)

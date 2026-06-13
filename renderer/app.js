@@ -25,12 +25,7 @@ const QUALITY_PRESETS = {
     { label: '360p', height: 360 },
   ],
   mkv: [
-    { label: '2160p (4K)', height: 2160 },
-    { label: '1440p (2K)', height: 1440 },
-    { label: '1080p (Full HD)', height: 1080 },
-    { label: '720p (HD)', height: 720 },
-    { label: '480p (SD)', height: 480 },
-    { label: '360p', height: 360 },
+    { label: 'Best Available', height: 2160 },
   ],
   mp3: [
     { label: 'Best (320kbps)', quality: '0' },
@@ -50,7 +45,12 @@ function setupActionListeners() {
   $('#cancelBtn').addEventListener('click', cancelAll)
   $('#selectAll').addEventListener('change', (e) => {
     const checked = e.target.checked
-    videoList.forEach(v => { v._selected = checked })
+    const filter = $('#searchInput').value.toLowerCase().trim()
+    videoList.forEach(v => {
+      const matches = !filter || (v.title || '').toLowerCase().includes(filter)
+      if (matches) v._selected = checked
+      if (checked && v._failed) v._failed = false
+    })
     renderPlaylist()
   })
   $('#retryFailedBtn').addEventListener('click', retryAllFailed)
@@ -402,6 +402,7 @@ function renderPlaylist() {
     check.checked = v._selected !== false && !v._failed
     check.addEventListener('change', () => {
       v._selected = check.checked
+      if (check.checked && v._failed) v._failed = false
       updateSelectAllState()
     })
 
@@ -520,16 +521,6 @@ function updateSelectAllState() {
   $('#selectAll').checked = allChecked
   $('#selectAll').indeterminate = false
 }
-
-$('#selectAll').addEventListener('change', () => {
-  const checked = $('#selectAll').checked
-  const filter = $('#searchInput').value.toLowerCase().trim()
-  videoList.forEach(v => {
-    const matches = !filter || (v.title || '').toLowerCase().includes(filter)
-    if (matches) v._selected = checked
-  })
-  renderPlaylist()
-})
 
 function escapeHtml(str) {
   const d = document.createElement('div')
@@ -889,7 +880,7 @@ function handleProgress(data) {
   if (d.paused) return
 
   d.status = 'downloading'
-  d.percent = data.percent || 0
+  d.percent = Math.max(d.percent || 0, data.percent || 0)
   d.speed = data.speed
   d.eta = data.eta
   d.downloaded = data.downloaded
