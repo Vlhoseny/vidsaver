@@ -28,7 +28,7 @@ function getFormatString(type, preset) {
   if (type === 'mkv') {
     return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`
   }
-  return `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio[acodec*=mp4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`
+  return `bestvideo[height<=${h}][vcodec*=avc1]+bestaudio/best[height<=${h}]`
 }
 
 function estimateSize(formats, type, preset) {

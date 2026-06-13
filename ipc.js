@@ -1,6 +1,10 @@
-const { ipcMain, dialog, Notification, shell } = require('electron')
-const { fetchVideoInfo, fetchVideoDetails, downloadVideo, cancelOne, cancelAll } = require('./downloader')
+const { ipcMain, dialog, Notification, shell, clipboard } = require('electron')
+const { fetchVideoInfo, fetchVideoDetails, downloadVideo, cancelOne, pauseOne, cancelAll } = require('./downloader')
 const config = require('./config')
+
+function isWindowAlive(win) {
+  return win && !win.isDestroyed() && win.webContents && !win.webContents.isDestroyed()
+}
 
 function registerIpcHandlers(mainWindow) {
   ipcMain.handle('fetch-info', async (_event, url) => {
@@ -27,11 +31,21 @@ function registerIpcHandlers(mainWindow) {
     return result.filePaths[0]
   })
 
-  ipcMain.handle('download', async (_event, url, outputDir, type, preset, videoId, subs) => {
+  ipcMain.handle('read-clipboard', () => {
+    try {
+      return clipboard.readText()
+    } catch {
+      return ''
+    }
+  })
+
+  ipcMain.handle('download', async (_event, url, outputDir, type, preset, videoId) => {
     try {
       await downloadVideo(url, outputDir, type, preset, videoId, (progress) => {
-        mainWindow.webContents.send('download-progress', progress)
-      }, subs)
+        if (isWindowAlive(mainWindow)) {
+          mainWindow.webContents.send('download-progress', progress)
+        }
+      })
       return { success: true }
     } catch (err) {
       return { success: false, error: err.message }
@@ -39,6 +53,7 @@ function registerIpcHandlers(mainWindow) {
   })
 
   ipcMain.handle('cancel-one', (_event, videoId) => cancelOne(videoId))
+  ipcMain.handle('pause-one', (_event, videoId) => pauseOne(videoId))
   ipcMain.handle('cancel-all', () => cancelAll())
 
   ipcMain.handle('get-config', () => config.load())

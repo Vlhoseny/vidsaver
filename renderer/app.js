@@ -1,3 +1,20 @@
+const $ = (s) => document.querySelector(s)
+const $$ = (s) => document.querySelectorAll(s)
+
+let videoList = []
+let downloading = new Map()
+let activeCount = 0
+let totalVideos = 0
+let totalBytes = 0
+let completedBytes = 0
+let qualityPresets = []
+let sampleFormats = []
+let queue = []
+let dragState = null
+let clipboardInterval = null
+let clipboardActive = false
+let imageCache = new Map()
+
 const QUALITY_PRESETS = {
   mp4: [
     { label: '2160p (4K)', height: 2160 },
@@ -22,861 +39,985 @@ const QUALITY_PRESETS = {
   ],
 }
 
-function estimateSize(formats, type, preset) {
-  if (!formats || formats.length === 0) return null
-  if (type === 'mp3') {
-    const audio = formats.filter(f => f.vcodec === 'none' && f.abr).sort((a, b) => (b.abr || 0) - (a.abr || 0))[0]
-    return audio?.filesize || audio?.filesize_approx || null
-  }
-  const height = preset.height
-  const video = formats.filter(f => f.vcodec !== 'none' && f.height && f.height <= height && f.acodec === 'none').sort((a, b) => (b.height || 0) - (a.height || 0))[0]
-  const audio = formats.filter(f => f.vcodec === 'none' && f.abr).sort((a, b) => (b.abr || 0) - (a.abr || 0))[0]
-  const vs = video?.filesize || video?.filesize_approx || 0
-  const as = audio?.filesize || audio?.filesize_approx || 0
-  const total = vs + as
-  return total > 0 ? total : null
+const API = window.api
+
+function setupActionListeners() {
+  $('#fetchBtn').addEventListener('click', fetchPlaylist)
+  $('#urlInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') fetchPlaylist()
+  })
+  $('#downloadBtn').addEventListener('click', startDownload)
+  $('#cancelBtn').addEventListener('click', cancelAll)
+  $('#selectAll').addEventListener('change', (e) => {
+    const checked = e.target.checked
+    videoList.forEach(v => { v._selected = checked })
+    renderPlaylist()
+  })
+  $('#retryFailedBtn').addEventListener('click', retryAllFailed)
+  $('#pathBtn').addEventListener('click', async () => {
+    const dir = await API.selectDir()
+    if (dir) {
+      $('#pathDisplay').textContent = dir
+      API.saveConfig({ defaultDir: dir })
+    }
+  })
+  $('#themeBtn').addEventListener('click', cycleTheme)
+  $('#clipboardBtn').addEventListener('click', () => {
+    clipboardActive = !clipboardActive
+    API.saveConfig({ clipboardMonitor: clipboardActive })
+    updateClipboardIndicator()
+    if (clipboardActive) startClipboardPoll()
+    else stopClipboardPoll()
+  })
+  $('#statsBtn').addEventListener('click', showStatsDialog)
+  $('#feedbackBtn').addEventListener('click', () => API.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new'))
+  $('#bugBtn').addEventListener('click', () => API.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new'))
 }
 
-function fmtBytes(b) {
-  if (!b) return 'Unknown'
-  const u = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  let s = b
-  while (s >= 1024 && i < u.length - 1) { s /= 1024; i++ }
-  return `${s.toFixed(1)} ${u[i]}`
+function setupContextMenu() {
+  $('#videoList').addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.video-item')
+    if (!item) return
+    e.preventDefault()
+    const menu = $('#contextMenu')
+    menu.style.left = e.clientX + 'px'
+    menu.style.top = e.clientY + 'px'
+    menu.classList.remove('hidden')
+    menu._videoId = item.dataset.id
+  })
+  document.addEventListener('click', () => {
+    $('#contextMenu').classList.add('hidden')
+  })
+  document.querySelectorAll('.ctx-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const menu = $('#contextMenu')
+      const id = menu._videoId
+      const action = el.dataset.action
+      menu.classList.add('hidden')
+      if (!id) return
+      if (action === 'copy-title') {
+        const v = videoList.find(x => x.id === id)
+        if (v) navigator.clipboard.writeText(v.title)
+      } else if (action === 'open-browser') {
+        API.openUrl(`https://www.youtube.com/watch?v=${id}`)
+      } else if (action === 'retry') {
+        retryVideo(id)
+      }
+    })
+  })
 }
 
-function fmtDur(s) {
-  if (!s) return '00:00'
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const sec = Math.floor(s % 60)
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
-  return `${m}:${String(sec).padStart(2, '0')}`
+function setupKeyboardShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      $('#contextMenu').classList.add('hidden')
+      document.querySelectorAll('.dialog-overlay:not(.hidden)').forEach(d => d.classList.add('hidden'))
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault()
+      $('#searchInput').focus()
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+      setTimeout(fetchPlaylist, 100)
+    }
+  })
 }
 
-function sanitizeFolder(name) {
-  if (!name) return ''
-  return name.replace(/[<>:"/\\|?*]/g, '_').trim().slice(0, 100)
+function showStatsDialog() {
+  const stats = loadStats()
+  const vids = stats.totalVideos || 0
+  const size = stats.totalSize || 0
+  const sess = stats.sessionCount || 0
+  const dls = stats.downloads || 0
+  $('#statTotalVideos').textContent = formatCount(vids)
+  $('#statTotalSize').textContent = formatBytes(size)
+  $('#statSessionCount').textContent = formatCount(sess)
+  $('#statDownloads').textContent = formatCount(dls)
+  $('#statsDialog').classList.remove('hidden')
 }
 
-// --- DOM refs ---
-const urlInput = document.getElementById('urlInput')
-const urlHistory = document.getElementById('urlHistory')
-const fetchBtn = document.getElementById('fetchBtn')
-const errorBar = document.getElementById('errorBar')
-const mainContent = document.getElementById('mainContent')
-const emptyState = document.getElementById('emptyState')
-const videoList = document.getElementById('videoList')
-const searchInput = document.getElementById('searchInput')
-const selectAll = document.getElementById('selectAll')
-const videoCount = document.getElementById('videoCount')
-const formatSelect = document.getElementById('formatSelect')
-const qualitySelect = document.getElementById('qualitySelect')
-const subsCheck = document.getElementById('subsCheck')
-const concurrentSelect = document.getElementById('concurrentSelect')
-const pathBtn = document.getElementById('pathBtn')
-const pathDisplay = document.getElementById('pathDisplay')
-const totalSize = document.getElementById('totalSize')
-const downloadBtn = document.getElementById('downloadBtn')
-const cancelBtn = document.getElementById('cancelBtn')
-const statusText = document.getElementById('statusText')
-const progressContainer = document.getElementById('progressContainer')
-const progressBar = document.getElementById('progressBar')
-const progressLabel = document.getElementById('progressLabel')
-const progressPercent = document.getElementById('progressPercent')
-const themeBtn = document.getElementById('themeBtn')
-const themeIcon = document.getElementById('themeIcon')
-const feedbackBtn = document.getElementById('feedbackBtn')
-const bugBtn = document.getElementById('bugBtn')
-const statsBtn = document.getElementById('statsBtn')
-const presetSelect = document.getElementById('presetSelect')
-const savePresetBtn = document.getElementById('savePresetBtn')
-const deletePresetBtn = document.getElementById('deletePresetBtn')
-const presetNameInput = document.getElementById('presetNameInput')
-const presetDialog = document.getElementById('presetDialog')
-const presetCancelBtn = document.getElementById('presetCancelBtn')
-const presetConfirmBtn = document.getElementById('presetConfirmBtn')
-const contextMenu = document.getElementById('contextMenu')
-const etaInfo = document.getElementById('etaInfo')
-const etaText = document.getElementById('etaText')
-const updateBanner = document.getElementById('updateBanner')
-const updateText = document.getElementById('updateText')
-const updateLink = document.getElementById('updateLink')
-const updateDismiss = document.getElementById('updateDismiss')
-const statsDialog = document.getElementById('statsDialog')
-const statsCloseBtn = document.getElementById('statsCloseBtn')
-const statTotalVideos = document.getElementById('statTotalVideos')
-const statTotalSize = document.getElementById('statTotalSize')
-const statSessionCount = document.getElementById('statSessionCount')
-const statDownloads = document.getElementById('statDownloads')
-
-let videos = []
-let selectedDir = ''
-let isDownloading = false
-let removeProgressListener = null
-let qualityIndex = 0
-let presets = []
-let urlHistoryList = []
-let filterText = ''
-let playlistTitle = ''
-let activeDownloads = new Set()
-let downloadStats = { totalVideos: 0, totalSize: 0, sessionCount: 0 }
-let progressData = new Map()
-
-// --- Config ---
-async function loadConfig() {
-  const cfg = await window.api.getConfig()
-  if (cfg.defaultDir) {
-    selectedDir = cfg.defaultDir
-    pathDisplay.textContent = cfg.defaultDir
-    updateDownloadBtn()
-  }
-  if (cfg.theme === 'light') {
-    document.documentElement.classList.add('light')
-    updateThemeIcon()
-  } else if (cfg.theme === 'oled') {
-    document.documentElement.classList.add('oled')
-    updateThemeIcon()
-  }
-  if (cfg.presets) {
-    presets = cfg.presets
-    populatePresets()
-  }
-  if (cfg.urlHistory) {
-    urlHistoryList = cfg.urlHistory
-    populateUrlHistory()
-  }
-  if (cfg.downloadStats) {
-    downloadStats = cfg.downloadStats
+async function checkForUpdate() {
+  try {
+    const info = await API.checkUpdate()
+    if (info && info.hasUpdate) {
+      $('#updateVersionName').textContent = info.version || ''
+      $('#updateBanner').classList.remove('hidden')
+      $('#updateShowBtn').onclick = () => {
+        $('#updateDialog').classList.remove('hidden')
+      }
+      $('#updateDismiss').onclick = () => {
+        $('#updateBanner').classList.add('hidden')
+      }
+      $('#updateGoBtn').onclick = () => {
+        API.openUrl(info.url || 'https://github.com/Vlhoseny/vidsaver/releases')
+      }
+      $('#updateLaterBtn').onclick = () => {
+        $('#updateDialog').classList.add('hidden')
+      }
+    }
+  } catch {
+    /* silent */
   }
 }
 
-async function saveConfig(partial) {
-  await window.api.saveConfig(partial)
-}
+document.addEventListener('DOMContentLoaded', async () => {
+  loadTheme()
+  await loadConfig()
+  setupFormatListeners()
+  setupQualityDropdown('mp4')
+  setupActionListeners()
+  setupContextMenu()
+  setupKeyboardShortcuts()
+  setupSearch()
+  setupStats()
+  setupDialogs()
+  setupClipboard()
+  setupDragReorder()
+  checkForUpdate()
+})
 
-// --- Theme ---
-const THEMES = ['dark', 'light', 'oled']
-function getCurrentTheme() {
-  const el = document.documentElement
-  if (el.classList.contains('oled')) return 'oled'
-  if (el.classList.contains('light')) return 'light'
-  return 'dark'
-}
-
-function updateThemeIcon() {
-  const t = getCurrentTheme()
-  if (t === 'light') {
-    themeIcon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
-  } else if (t === 'oled') {
-    themeIcon.innerHTML = '<circle cx="12" cy="12" r="5" fill="currentColor"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
-  } else {
-    themeIcon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'
-  }
+function loadTheme() {
+  const saved = localStorage.getItem('vidsaver-theme') || 'dark'
+  document.documentElement.setAttribute('data-theme', saved)
+  updateThemeIcon(saved)
 }
 
 function cycleTheme() {
-  const cur = getCurrentTheme()
-  const nextIdx = (THEMES.indexOf(cur) + 1) % THEMES.length
-  const next = THEMES[nextIdx]
-  const el = document.documentElement
-  el.classList.remove('light', 'oled')
-  if (next !== 'dark') el.classList.add(next)
-  updateThemeIcon()
-  saveConfig({ theme: next })
+  const cur = document.documentElement.getAttribute('data-theme')
+  const next = cur === 'dark' ? 'light' : cur === 'light' ? 'oled' : 'dark'
+  document.documentElement.setAttribute('data-theme', next)
+  localStorage.setItem('vidsaver-theme', next)
+  updateThemeIcon(next)
 }
 
-themeBtn.addEventListener('click', cycleTheme)
-
-feedbackBtn.addEventListener('click', () => {
-  window.api.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new?template=feature_request.md')
-})
-
-bugBtn.addEventListener('click', () => {
-  window.api.openUrl('https://github.com/Vlhoseny/vidsaver/issues/new')
-})
-
-// --- URL History ---
-function populateUrlHistory() {
-  urlHistory.innerHTML = urlHistoryList.map(u => `<option value="${u.replace(/"/g, '&quot;')}">`).join('')
-}
-
-function addUrlToHistory(url) {
-  if (!url) return
-  urlHistoryList = urlHistoryList.filter(u => u !== url)
-  urlHistoryList.unshift(url)
-  if (urlHistoryList.length > 20) urlHistoryList = urlHistoryList.slice(0, 20)
-  populateUrlHistory()
-  saveConfig({ urlHistory: urlHistoryList })
-}
-
-// --- Stats ---
-function updateStatsDisplay() {
-  statTotalVideos.textContent = downloadStats.totalVideos || 0
-  statTotalSize.textContent = fmtBytes(downloadStats.totalSize || 0)
-  statSessionCount.textContent = downloadStats.sessionCount || 0
-  statDownloads.textContent = (downloadStats.sessionDownloads || 0)
-}
-
-// --- Presets ---
-function populatePresets() {
-  presetSelect.innerHTML = '<option value="">(none)</option>'
-  for (const p of presets) {
-    const opt = document.createElement('option')
-    opt.value = p.name
-    opt.textContent = p.name
-    presetSelect.appendChild(opt)
-  }
-}
-
-function applyPreset(name) {
-  const p = presets.find(x => x.name === name)
-  if (!p) return
-  formatSelect.value = p.format || 'mp4'
-  populateQuality()
-  if (p.qualityIndex != null) {
-    qualityIndex = p.qualityIndex
-    qualitySelect.value = p.qualityIndex
-  }
-  if (p.folder && p.folder !== selectedDir) {
-    selectedDir = p.folder
-    pathDisplay.textContent = p.folder
-  }
-  updateSizes()
-  updateDownloadBtn()
-  deletePresetBtn.classList.toggle('hidden', false)
-}
-
-presetSelect.addEventListener('change', () => {
-  if (presetSelect.value) {
-    applyPreset(presetSelect.value)
+function updateThemeIcon(theme) {
+  const icon = $('#themeIcon')
+  if (theme === 'dark') {
+    icon.innerHTML = `<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>`
+  } else if (theme === 'light') {
+    icon.innerHTML = `<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>`
   } else {
-    deletePresetBtn.classList.add('hidden')
-  }
-})
-
-savePresetBtn.addEventListener('click', () => {
-  presetNameInput.value = ''
-  presetDialog.classList.remove('hidden')
-  setTimeout(() => presetNameInput.focus(), 100)
-})
-
-presetCancelBtn.addEventListener('click', () => {
-  presetDialog.classList.add('hidden')
-})
-
-presetConfirmBtn.addEventListener('click', () => {
-  const name = presetNameInput.value.trim()
-  if (!name) return
-  const idx = presets.findIndex(p => p.name === name)
-  const entry = {
-    name,
-    format: formatSelect.value,
-    qualityIndex,
-    folder: selectedDir,
-  }
-  if (idx >= 0) presets[idx] = entry
-  else presets.push(entry)
-  presets.sort((a, b) => a.name.localeCompare(b.name))
-  populatePresets()
-  presetSelect.value = name
-  deletePresetBtn.classList.toggle('hidden', false)
-  presetDialog.classList.add('hidden')
-  saveConfig({ presets })
-})
-
-presetNameInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') presetConfirmBtn.click()
-})
-
-deletePresetBtn.addEventListener('click', () => {
-  const name = presetSelect.value
-  if (!name) return
-  presets = presets.filter(p => p.name !== name)
-  populatePresets()
-  presetSelect.value = ''
-  deletePresetBtn.classList.add('hidden')
-  saveConfig({ presets })
-})
-
-// --- Format/quality ---
-function getQualityPreset() {
-  return QUALITY_PRESETS[formatSelect.value][qualityIndex]
-}
-
-function populateQuality() {
-  qualityIndex = 0
-  const type = formatSelect.value
-  const qps = QUALITY_PRESETS[type]
-  qualitySelect.innerHTML = qps.map((p, i) => `<option value="${i}">${p.label}</option>`).join('')
-}
-
-formatSelect.addEventListener('change', () => {
-  populateQuality()
-  updateSizes()
-})
-
-qualitySelect.addEventListener('change', () => {
-  qualityIndex = parseInt(qualitySelect.value, 10)
-  updateSizes()
-})
-
-populateQuality()
-
-// --- Search ---
-searchInput.addEventListener('input', () => {
-  filterText = searchInput.value.trim().toLowerCase()
-  applyFilter()
-})
-
-function applyFilter() {
-  for (const v of videos) {
-    const el = videoList.querySelector(`[data-index="${v.index}"]`)
-    if (!el) continue
-    const match = !filterText || v.title.toLowerCase().includes(filterText)
-    el.classList.toggle('filtered-out', !match && v.status === 'idle')
+    icon.innerHTML = `<circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 0 0 20z"/>`
   }
 }
 
-// --- Fetch ---
-fetchBtn.addEventListener('click', fetchVideos)
-urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchVideos() })
+async function loadConfig() {
+  const cfg = await API.getConfig()
+  if (cfg.defaultDir) {
+    $('#pathDisplay').textContent = cfg.defaultDir
+  }
+  if (cfg.clipboardMonitor !== undefined) {
+    clipboardActive = cfg.clipboardMonitor
+    updateClipboardIndicator()
+  }
+  if (cfg.format) {
+    $('#formatSelect').value = cfg.format
+    setupQualityDropdown(cfg.format)
+  }
+  if (cfg.quality !== undefined) {
+    const qs = $('#qualitySelect')
+    if (qs.options[cfg.quality]) {
+      qs.selectedIndex = cfg.quality
+    }
+  }
+}
 
-async function fetchVideos() {
-  const url = urlInput.value.trim()
-  if (!url) return
+function loadStats() {
+  try {
+    const raw = localStorage.getItem('vidsaver-stats')
+    return raw ? JSON.parse(raw) : { totalVideos: 0, totalSize: 0, sessionCount: 0, downloads: 0 }
+  } catch {
+    return { totalVideos: 0, totalSize: 0, sessionCount: 0, downloads: 0 }
+  }
+}
 
-  setError('')
-  fetchBtn.disabled = true
-  fetchBtn.innerHTML = '<div class="spinner"></div>'
-  mainContent.classList.add('hidden')
-  emptyState.classList.add('hidden')
+function saveStats(stats) {
+  localStorage.setItem('vidsaver-stats', JSON.stringify(stats))
+}
+
+function setupFormatListeners() {
+  $('#formatSelect').addEventListener('change', () => {
+    const fmt = $('#formatSelect').value
+    setupQualityDropdown(fmt)
+    API.saveConfig({ format: fmt })
+    updateSizeEstimate()
+  })
+  $('#qualitySelect').addEventListener('change', () => {
+    API.saveConfig({ quality: $('#qualitySelect').selectedIndex })
+    updateSizeEstimate()
+  })
+}
+
+function setupQualityDropdown(format) {
+  const qs = $('#qualitySelect')
+  qs.innerHTML = ''
+  const list = QUALITY_PRESETS[format] || []
+  list.forEach((p, i) => {
+    const opt = document.createElement('option')
+    opt.value = String(p.height ?? p.quality ?? '')
+    opt.textContent = p.label
+    if (i === 0) opt.selected = true
+    qs.appendChild(opt)
+  })
+  qualityPresets = list
+}
+
+function getFormatAndPreset() {
+  const fmt = $('#formatSelect').value
+  const idx = $('#qualitySelect').selectedIndex
+  const preset = qualityPresets[idx]
+  return { format: fmt, preset, qualityIndex: idx }
+}
+
+function updateSizeEstimate() {
+  if (totalBytes <= 0) {
+    $('#totalSize').textContent = 'Estimating...'
+    return
+  }
+  const done = completedBytes
+  const remaining = Math.max(0, totalBytes - done)
+  if (remaining > 0 && done > 0) {
+    $('#totalSize').textContent = `~${formatBytes(remaining)} remaining of ${formatBytes(totalBytes)}`
+  } else {
+    $('#totalSize').textContent = `~${formatBytes(totalBytes)}`
+  }
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let i = 0
+  let size = bytes
+  while (size >= 1024 && i < units.length - 1) {
+    size /= 1024; i++
+  }
+  return size.toFixed(i > 0 ? 1 : 0) + ' ' + units[i]
+}
+
+function formatDuration(sec) {
+  if (!sec) return '0:00'
+  const m = Math.floor(sec / 60)
+  const s = Math.floor(sec % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function estimateSize(format, presetValue, duration) {
+  if (format === 'mp3') {
+    const bitrates = { 0: 320, 5: 192, 9: 128 }
+    const bitrate = bitrates[presetValue] || 128
+    return (bitrate * 1000 * (duration || 180)) / 8
+  }
+  const MBperSec = { 360: 0.1, 480: 0.2, 720: 0.5, 1080: 1.2, 1440: 2.0, 2160: 4.0 }
+  const mbps = MBperSec[presetValue] || 1.0
+  return mbps * 1024 * 1024 * (duration || 180)
+}
+
+async function fetchPlaylist() {
+  const url = $('#urlInput').value.trim()
+  if (!url) { showError('Please enter a URL'); return }
+
+  $('#fetchBtn').disabled = true
+  $('#fetchBtn').textContent = 'Fetching...'
+  hideError()
 
   try {
-    const items = await window.api.fetchInfo(url)
-    if (!items || items.length === 0) throw new Error('No videos found')
+      const data = await API.fetchInfo(url)
+      if (!data || !Array.isArray(data) || data.length === 0) {
+        showError('Could not fetch playlist info. Check the URL and try again.')
+        $('#fetchBtn').disabled = false
+        $('#fetchBtn').textContent = 'Fetch'
+        return
+      }
 
-    playlistTitle = items[0]?.playlist_title || ''
-    addUrlToHistory(url)
+      addToHistory(url)
+      videoList = data.filter(e => e && e.id)
+      totalVideos = videoList.length
+      queue = videoList.map(v => v.id)
+      completedBytes = 0
+      totalBytes = 0
+      sampleFormats = []
 
-    videos = items.map((item, i) => ({
-      id: item.id,
-      index: i,
-      title: item.title || 'Unknown',
-      duration: item.duration || 0,
-      thumbnail: getBestThumb(item.thumbnails),
-      formats: item.formats || [],
-      selected: true,
-      status: 'idle',
-    }))
-
-    renderList()
-    mainContent.classList.remove('hidden')
-    updateSizes()
-  } catch (err) {
-    setError(err.message)
-    emptyState.classList.remove('hidden')
-  } finally {
-    fetchBtn.disabled = false
-    fetchBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7"/></svg> Fetch'
-  }
-}
-
-function getBestThumb(thumbnails) {
-  if (!thumbnails || thumbnails.length === 0) return ''
-  return thumbnails[thumbnails.length - 1]?.url || thumbnails[0]?.url || ''
-}
-
-// --- Render ---
-function renderList() {
-  videoList.innerHTML = ''
-  const type = formatSelect.value
-  const preset = getQualityPreset()
-
-  for (const v of videos) {
-    const size = estimateSize(v.formats, type, preset)
-    const item = document.createElement('div')
-    item.className = `video-item${v.status !== 'idle' ? ' ' + v.status : ''}`
-    if (filterText && !v.title.toLowerCase().includes(filterText) && v.status === 'idle') {
-      item.classList.add('filtered-out')
-    }
-    item.dataset.index = v.index
-
-    const thumb = v.thumbnail
-      ? `<img class="video-thumb" src="${v.thumbnail}" alt="" loading="lazy">`
-      : `<div class="video-thumb" style="background:var(--surface2)"></div>`
-
-    const sizeText = size ? fmtBytes(size) : ''
-
-    let statusHtml = ''
-    if (v.status === 'downloading') {
-      const pct = progressData.get(v.id)?.percent || 0
-      statusHtml = `<span class="video-status downloading">${Math.round(pct)}%</span>`
-    } else if (v.status === 'done') {
-      statusHtml = '<span class="video-status done">&#10003;</span>'
-    } else if (v.status === 'error') {
-      statusHtml = '<span class="video-status error">&#10007;</span>'
-    } else if (v.status === 'cancelled') {
-      statusHtml = '<span class="video-status error">&#10007;</span>'
+    const firstId = videoList[0]?.id
+    if (firstId) {
+      try {
+        const details = await API.fetchDetails(firstId)
+        if (details && details.formats) {
+          sampleFormats = details.formats
+        }
+      } catch {}
     }
 
-    const cancelOneHtml = v.status === 'downloading'
-      ? '<button class="cancel-one-btn" title="Cancel this download">&times;</button>'
-      : ''
+    setupQualityDropdown($('#formatSelect').value)
 
-    item.innerHTML = `
-      <input type="checkbox" ${v.selected ? 'checked' : ''} ${v.status !== 'idle' && v.status !== 'cancelled' ? 'disabled' : ''}>
-      ${thumb}
-      <div class="video-info">
-        <div class="video-title">${escapeHtml(v.title)}</div>
-        <div class="video-meta">
-          <span>${fmtDur(v.duration)}</span>
-          <span class="video-size">${sizeText}</span>
-        </div>
-      </div>
-      ${statusHtml}
-      ${cancelOneHtml}
-    `
-
-    const cb = item.querySelector('input[type="checkbox"]')
-    cb.addEventListener('change', () => {
-      v.selected = cb.checked
-      updateSelectAllState()
-      updateSizes()
+    videoList.forEach(v => {
+      const idx = $('#qualitySelect').selectedIndex
+      const sel = qualityPresets[idx]
+      const val = sel?.height ?? 720
+      const size = estimateSize(
+        $('#formatSelect').value,
+        val,
+        v.duration
+      )
+      v.estimatedSize = size
+      totalBytes += size
     })
 
-    const cancelBtnEl = item.querySelector('.cancel-one-btn')
-    if (cancelBtnEl) {
-      cancelBtnEl.addEventListener('click', (e) => {
-        e.stopPropagation()
-        cancelOneDownload(v)
-      })
+    renderPlaylist()
+    $('#mainContent').classList.remove('hidden')
+    $('#emptyState').classList.add('hidden')
+    $('.main-area').classList.remove('empty')
+    updateSizeEstimate()
+    $('#downloadBtn').disabled = false
+  } catch (err) {
+    showError(err.message || 'Failed to fetch playlist')
+  } finally {
+    $('#fetchBtn').disabled = false
+    $('#fetchBtn').textContent = 'Fetch'
+  }
+}
+
+function renderPlaylist() {
+  const list = $('#videoList')
+  list.innerHTML = ''
+  const filter = $('#searchInput').value.toLowerCase().trim()
+  const shown = filter ? videoList.filter(v => (v.title || '').toLowerCase().includes(filter)) : videoList
+
+  shown.forEach((v) => {
+    const downloadState = downloading.get(v.id)
+    const status = downloadState?.status || 'idle'
+    const paused = downloadState?.paused || false
+
+    const item = document.createElement('div')
+    item.className = `video-item ${status !== 'idle' ? status : ''} ${paused ? 'paused' : ''}`
+    if (v._failed) item.classList.add('error')
+    item.dataset.videoId = v.id
+
+    const dragHandle = document.createElement('div')
+    dragHandle.className = 'drag-handle'
+    dragHandle.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="19" r="1"/></svg>`
+
+    const check = document.createElement('input')
+    check.type = 'checkbox'
+    check.className = 'video-check'
+    check.checked = v._selected !== false && !v._failed
+    check.addEventListener('change', () => {
+      v._selected = check.checked
+      updateSelectAllState()
+    })
+
+    const thumb = document.createElement('div')
+    thumb.className = 'thumb-wrap'
+    const img = document.createElement('img')
+    const cached = imageCache.get(v.id)
+    if (cached) {
+      img.src = cached
+    } else {
+      img.src = v.thumbnail || `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`
+      img.onload = () => imageCache.set(v.id, img.src)
+      img.onerror = () => { img.src = ''; img.style.display = 'none' }
+    }
+    img.alt = v.title || ''
+    img.loading = 'lazy'
+    thumb.appendChild(img)
+
+    const info = document.createElement('div')
+    info.className = 'video-info'
+    info.innerHTML = `
+      <div class="video-title">${escapeHtml(v.title || 'Unknown')}</div>
+      <div class="video-meta">
+        <span>${v.channel || ''}</span>
+        ${v.duration ? `<span>${formatDuration(v.duration)}</span>` : ''}
+        ${v.view_count ? `<span>${formatCount(v.view_count)} views</span>` : ''}
+      </div>
+      <div class="video-size">${formatBytes(v.estimatedSize || 0)}</div>
+    `
+
+    const statusEl = document.createElement('div')
+    statusEl.className = `video-status ${status !== 'idle' ? status : (v._failed ? 'error' : 'idle')}`
+    if (downloadState) {
+      statusEl.textContent = paused ? 'Paused' : downloadState.percent ? `${downloadState.percent}%` : status
+    } else if (v._failed) {
+      statusEl.textContent = 'Failed'
+    } else {
+      statusEl.textContent = 'Ready'
     }
 
-    item.addEventListener('contextmenu', (e) => showContextMenu(e, v))
+    const actions = document.createElement('div')
+    actions.className = 'video-actions'
 
-    videoList.appendChild(item)
-  }
+    if (paused) {
+      const resumeBtn = document.createElement('button')
+      resumeBtn.className = 'item-action-btn'
+      resumeBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>`
+      resumeBtn.title = 'Resume'
+      resumeBtn.addEventListener('click', (e) => { e.stopPropagation(); resumeDownload(v.id) })
+      actions.appendChild(resumeBtn)
+    } else if (status === 'downloading') {
+      const pauseBtn = document.createElement('button')
+      pauseBtn.className = 'item-action-btn'
+      pauseBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`
+      pauseBtn.title = 'Pause'
+      pauseBtn.addEventListener('click', (e) => { e.stopPropagation(); pauseDownload(v.id) })
+      actions.appendChild(pauseBtn)
+    }
+
+    if (status !== 'idle' && !paused) {
+      const cancelBtn = document.createElement('button')
+      cancelBtn.className = 'item-action-btn danger'
+      cancelBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`
+      cancelBtn.title = 'Cancel'
+      cancelBtn.addEventListener('click', (e) => { e.stopPropagation(); doCancelOne(v.id) })
+      actions.appendChild(cancelBtn)
+    }
+
+    if (v._failed && !downloading.has(v.id)) {
+      const retryBtn = document.createElement('button')
+      retryBtn.className = 'item-action-btn'
+      retryBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`
+      retryBtn.title = 'Retry'
+      retryBtn.addEventListener('click', (e) => { e.stopPropagation(); retryVideo(v.id) })
+      actions.appendChild(retryBtn)
+
+      checkFailedItems()
+    }
+
+    item.appendChild(dragHandle)
+    item.appendChild(check)
+    item.appendChild(thumb)
+    item.appendChild(info)
+    item.appendChild(statusEl)
+    item.appendChild(actions)
+
+    item.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      showContextMenu(e.clientX, e.clientY, v)
+    })
+
+    item.addEventListener('dblclick', () => {
+      if (v.id) {
+        API.openUrl(`https://www.youtube.com/watch?v=${v.id}`)
+      }
+    })
+
+    addDragListeners(item, v.id)
+
+    list.appendChild(item)
+  })
 
   updateSelectAllState()
-  updateCount()
+  updateVideoCount()
 }
 
-function updateVideoItem(index) {
-  const v = videos[index]
-  if (!v) return
-  const el = videoList.querySelector(`[data-index="${index}"]`)
-  if (!el) return
-  el.className = `video-item${v.status !== 'idle' ? ' ' + v.status : ''}`
-  if (filterText && !v.title.toLowerCase().includes(filterText) && v.status === 'idle') {
-    el.classList.add('filtered-out')
-  }
-  const cb = el.querySelector('input[type="checkbox"]')
-  if (cb) cb.checked = v.selected
-  const statusEl = el.querySelector('.video-status')
-  const cancelBtnEl = el.querySelector('.cancel-one-btn')
-
-  if (v.status === 'downloading') {
-    const pct = progressData.get(v.id)?.percent || 0
-    if (!statusEl) el.insertAdjacentHTML('beforeend', `<span class="video-status downloading">${Math.round(pct)}%</span>`)
-    else { statusEl.className = 'video-status downloading'; statusEl.textContent = `${Math.round(pct)}%` }
-    if (!cancelBtnEl) el.insertAdjacentHTML('beforeend', '<button class="cancel-one-btn" title="Cancel this download">&times;</button>')
-  } else if (v.status === 'done') {
-    if (!statusEl) el.insertAdjacentHTML('beforeend', '<span class="video-status done">&#10003;</span>')
-    else { statusEl.className = 'video-status done'; statusEl.textContent = '&#10003;' }
-    if (cancelBtnEl) cancelBtnEl.remove()
-  } else if (v.status === 'error' || v.status === 'cancelled') {
-    if (!statusEl) el.insertAdjacentHTML('beforeend', '<span class="video-status error">&#10007;</span>')
-    else { statusEl.className = 'video-status error'; statusEl.textContent = '&#10007;' }
-    if (cancelBtnEl) cancelBtnEl.remove()
-  } else if (statusEl) {
-    statusEl.remove()
-    if (cancelBtnEl) cancelBtnEl.remove()
-  }
-}
-
-function escapeHtml(t) {
-  const d = document.createElement('div')
-  d.textContent = t
-  return d.innerHTML
+function updateVideoCount() {
+  const selected = videoList.filter(v => v._selected !== false && !v._failed).length
+  $('#videoCount').textContent = `${selected} / ${videoList.length} selected`
 }
 
 function updateSelectAllState() {
-  const allSelected = videos.every(v => v.selected || v.status !== 'idle')
-  const someSelected = videos.some(v => v.selected)
-  selectAll.checked = allSelected
-  selectAll.indeterminate = someSelected && !allSelected
+  const checks = $$('.video-check:not([disabled])')
+  const allChecked = [...checks].every(c => c.checked)
+  const anyChecked = [...checks].some(c => c.checked)
+  $('#selectAll').checked = allChecked
+  $('#selectAll').indeterminate = false
 }
 
-selectAll.addEventListener('change', () => {
-  for (const v of videos) {
-    if (v.status === 'idle') v.selected = selectAll.checked
-  }
-  renderList()
+$('#selectAll').addEventListener('change', () => {
+  const checked = $('#selectAll').checked
+  const filter = $('#searchInput').value.toLowerCase().trim()
+  videoList.forEach(v => {
+    const matches = !filter || (v.title || '').toLowerCase().includes(filter)
+    if (matches) v._selected = checked
+  })
+  renderPlaylist()
 })
 
-// --- Sizes ---
-function updateSizes() {
-  const type = formatSelect.value
-  const preset = getQualityPreset()
-  let total = 0
-  let hasSize = false
-
-  for (const v of videos) {
-    if (!v.selected) continue
-    const size = estimateSize(v.formats, type, preset)
-    if (size) { total += size; hasSize = true }
-  }
-
-  totalSize.textContent = hasSize ? `~${fmtBytes(total)}` : 'Size unknown'
-  updateCount()
-  updateDownloadBtn()
+function escapeHtml(str) {
+  const d = document.createElement('div')
+  d.textContent = str
+  return d.innerHTML
 }
 
-function updateCount() {
-  const count = videos.filter(v => v.selected).length
-  videoCount.textContent = `${count} / ${videos.length} videos`
+function formatCount(n) {
+  if (!n) return ''
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
+  return String(n)
 }
 
-// --- Path ---
-pathBtn.addEventListener('click', async () => {
-  const dir = await window.api.selectDir()
-  if (dir) {
-    selectedDir = dir
-    pathDisplay.textContent = dir
-    saveConfig({ defaultDir: dir })
-    updateDownloadBtn()
-  }
-})
-
-// --- Context menu ---
-let contextVideo = null
-
-function showContextMenu(e, v) {
-  e.preventDefault()
-  contextVideo = v
-  contextMenu.style.left = `${e.clientX}px`
-  contextMenu.style.top = `${e.clientY}px`
-  contextMenu.classList.remove('hidden')
-
-  const retryItem = contextMenu.querySelector('[data-action="retry"]')
-  retryItem.style.display = v.status === 'error' || v.status === 'cancelled' ? '' : 'none'
+function showError(msg) {
+  const bar = $('#errorBar')
+  bar.textContent = msg
+  bar.classList.remove('hidden')
 }
 
-document.addEventListener('click', () => {
-  contextMenu.classList.add('hidden')
-})
-
-contextMenu.addEventListener('click', (e) => {
-  const item = e.target.closest('.ctx-item')
-  if (!item) return
-  const action = item.dataset.action
-  const v = contextVideo
-  contextMenu.classList.add('hidden')
-
-  if (action === 'copy-title' && v) {
-    navigator.clipboard.writeText(v.title).catch(() => {})
-  } else if (action === 'open-browser' && v) {
-    window.api.openUrl(`https://www.youtube.com/watch?v=${v.id}`)
-  } else if (action === 'retry' && v) {
-    v.status = 'idle'
-    v.selected = true
-    renderList()
-  }
-})
-
-// --- Download ---
-function updateDownloadBtn() {
-  const hasVideos = videos.some(v => v.selected && (v.status === 'idle' || v.status === 'cancelled'))
-  const hasPath = !!selectedDir
-  downloadBtn.disabled = !(hasVideos && hasPath && !isDownloading)
+function hideError() {
+  $('#errorBar').classList.add('hidden')
 }
 
-downloadBtn.addEventListener('click', startDownload)
-cancelBtn.addEventListener('click', cancelAllDownloads)
-
-async function startDownload() {
-  if (isDownloading) return
-  const dir = selectedDir
-  if (!dir) return
-
-  const items = videos.filter(v => v.selected && (v.status === 'idle' || v.status === 'cancelled'))
-  if (items.length === 0) return
-
-  isDownloading = true
-  downloadBtn.classList.add('hidden')
-  cancelBtn.classList.remove('hidden')
-  progressContainer.classList.remove('hidden')
-  statusText.textContent = 'Downloading...'
-  progressBar.style.width = '0%'
-  progressLabel.textContent = 'Preparing...'
-  progressPercent.textContent = '0%'
-
-  activeDownloads = new Set()
-  progressData = new Map()
-
-  const subs = subsCheck.checked
-  const maxConc = parseInt(concurrentSelect.value, 10)
-  const type = formatSelect.value
-  const preset = getQualityPreset()
-  const usePlaylistFolder = playlistTitle && items.length > 1
-  const baseDir = usePlaylistFolder ? dir : ''
-  let playlistDir = ''
-
-  if (usePlaylistFolder) {
-    playlistDir = sanitizeFolder(playlistTitle)
+function addToHistory(url) {
+  const key = 'vidsaver-urls'
+  let history = []
+  try {
+    history = JSON.parse(localStorage.getItem(key) || '[]')
+  } catch {}
+  if (!history.includes(url)) {
+    history.unshift(url)
+    if (history.length > 50) history = history.slice(0, 50)
+    localStorage.setItem(key, JSON.stringify(history))
   }
+  const dl = $('#urlHistory')
+  dl.innerHTML = ''
+  history.forEach(u => {
+    const opt = document.createElement('option')
+    opt.value = u
+    dl.appendChild(opt)
+  })
+}
 
-  let totalCompleted = 0
-  const totalItems = items.length
-  const times = []
+function setupSearch() {
+  $('#searchInput').addEventListener('input', renderPlaylist)
+}
 
-  removeProgressListener = window.api.onProgress((data) => {
-    progressData.set(data.videoId, data)
-    const vid = videos.find(v => v.id === data.videoId)
-    if (vid) updateVideoItem(vid.index)
-    const allPcts = [...progressData.values()].map(p => p.percent)
-    const avgPct = allPcts.length > 0 ? allPcts.reduce((a, b) => a + b, 0) / allPcts.length : 0
-    progressBar.style.width = `${Math.min(avgPct, 99)}%`
-    progressPercent.textContent = `${Math.round(avgPct)}%`
-    const activeVid = videos.find(v => activeDownloads.has(v.id))
-    progressLabel.textContent = activeVid ? activeVid.title : '...'
-    statusText.textContent = `${totalCompleted} / ${totalItems} ${data.speed ? '· ' + data.speed : ''}`
+function setupDialogs() {
+  $('#statsCloseBtn').addEventListener('click', () => {
+    $('#statsDialog').classList.add('hidden')
   })
 
-  const trackSize = (v) => {
-    const s = estimateSize(v.formats, type, preset)
-    if (s) downloadStats.totalSize = (downloadStats.totalSize || 0) + s
+  $('#statsBtn').addEventListener('click', () => {
+    const stats = loadStats()
+    $('#statTotalVideos').textContent = stats.totalVideos
+    $('#statTotalSize').textContent = formatBytes(stats.totalSize)
+    $('#statSessionCount').textContent = stats.sessionCount
+    $('#statDownloads').textContent = stats.downloads
+    $('#statsDialog').classList.remove('hidden')
+  })
+}
+
+function setupStats() {
+  let stats = loadStats()
+  function track(type) {
+    if (type === 'download') {
+      stats.downloads++
+      stats.sessionCount++
+      saveStats(stats)
+    }
   }
 
-  async function worker() {
-    while (true) {
-      const v = items.find(x => x.status === 'idle' || x.status === 'cancelled')
-      if (!v) break
-      activeDownloads.add(v.id)
-      v.status = 'downloading'
-      updateVideoItem(v.index)
+  const origStart = startDownload
+  startDownload = function() {
+    track('download')
+    return origStart.apply(this, arguments)
+  }
+}
 
-      const outputDir = usePlaylistFolder
-        ? baseDir + '\\' + playlistDir
-        : dir
+function setupClipboard() {
+  $('#clipboardBtn').addEventListener('click', () => {
+    clipboardActive = !clipboardActive
+    API.saveConfig({ clipboardMonitor: clipboardActive })
+    updateClipboardIndicator()
+    if (clipboardActive) {
+      startClipboardPoll()
+    } else {
+      stopClipboardPoll()
+    }
+  })
 
-      const t0 = Date.now()
-      const result = await window.api.download(
-        `https://www.youtube.com/watch?v=${v.id}`,
-        outputDir, type, preset, v.id, subs
-      )
+  if (clipboardActive) {
+    startClipboardPoll()
+  }
+}
 
-      activeDownloads.delete(v.id)
+function updateClipboardIndicator() {
+  const btn = $('#clipboardBtn')
+  btn.style.color = clipboardActive ? 'var(--accent)' : ''
+}
 
-      if (!result.success) {
-        if (result.error === 'Download cancelled') {
-          v.status = 'cancelled'
-        } else {
-          v.status = 'error'
-          const msg = result.error ? result.error.slice(0, 100) : 'Download failed'
-          setError(`${v.title}: ${msg}`)
+function startClipboardPoll() {
+  stopClipboardPoll()
+  let lastText = ''
+  clipboardInterval = setInterval(async () => {
+    try {
+      const text = await API.readClipboard()
+      if (text && text !== lastText) {
+        lastText = text
+        const match = text.match(/(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/[\w\-\/]+/i)
+        if (match) {
+          const url = match[0]
+          const current = $('#urlInput').value.trim()
+          if (url !== current) {
+            $('#urlInput').value = url
+          }
         }
-        updateVideoItem(v.index)
-      } else {
-        v.status = 'done'
-        times.push(Date.now() - t0)
-        trackSize(v)
-        totalCompleted++
-        updateVideoItem(v.index)
-        updateEta(totalCompleted, totalItems, times)
-        const pct = Math.round((totalCompleted / totalItems) * 100)
-        progressBar.style.width = `${pct}%`
-        progressPercent.textContent = `${pct}%`
-        progressLabel.textContent = `Done: ${v.title}`
-        statusText.textContent = `${totalCompleted} / ${totalItems}`
+      }
+    } catch {}
+  }, 2000)
+}
+
+function stopClipboardPoll() {
+  if (clipboardInterval) {
+    clearInterval(clipboardInterval)
+    clipboardInterval = null
+  }
+}
+
+function setupDragReorder() {
+  let list = $('#videoList')
+
+  list.addEventListener('dragstart', (e) => {
+    const item = e.target.closest('.video-item')
+    if (!item) return
+    dragState = { id: item.dataset.videoId }
+    item.classList.add('dragging')
+    e.dataTransfer.effectAllowed = 'move'
+  })
+
+  list.addEventListener('dragend', (e) => {
+    const item = e.target.closest('.video-item')
+    if (item) item.classList.remove('dragging')
+    $$('.drag-over').forEach(el => el.classList.remove('drag-over'))
+    dragState = null
+  })
+
+  list.addEventListener('dragover', (e) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    const target = e.target.closest('.video-item')
+    if (!target || !dragState) return
+    $$('.drag-over').forEach(el => el.classList.remove('drag-over'))
+    target.classList.add('drag-over')
+  })
+
+  list.addEventListener('dragleave', (e) => {
+    const target = e.target.closest('.video-item')
+    if (target) target.classList.remove('drag-over')
+  })
+
+  list.addEventListener('drop', (e) => {
+    e.preventDefault()
+    const target = e.target.closest('.video-item')
+    if (!target || !dragState || dragState.id === target.dataset.videoId) {
+      $$('.drag-over').forEach(el => el.classList.remove('drag-over'))
+      dragState = null
+      return
+    }
+    $$('.drag-over').forEach(el => el.classList.remove('drag-over'))
+
+    const fromId = dragState.id
+    const toId = target.dataset.videoId
+    dragState = null
+
+    const fromIdx = videoList.findIndex(v => v.id === fromId)
+    const toIdx = videoList.findIndex(v => v.id === toId)
+    if (fromIdx === -1 || toIdx === -1) return
+
+    const [moved] = videoList.splice(fromIdx, 1)
+    const newToIdx = videoList.findIndex(v => v.id === toId)
+    videoList.splice(newToIdx + 1, 0, moved)
+
+    renderPlaylist()
+  })
+}
+
+function checkFailedItems() {
+  const hasFailed = videoList.some(v => v._failed)
+  $('#retryFailedBtn').classList.toggle('hidden', !hasFailed)
+}
+
+function retryVideo(videoId) {
+  const v = videoList.find(x => x.id === videoId)
+  if (v) {
+    v._failed = false
+    v._selected = true
+    downloading.delete(videoId)
+    renderPlaylist()
+    checkFailedItems()
+  }
+}
+
+function retryAllFailed() {
+  videoList.forEach(v => {
+    if (v._failed) {
+      v._failed = false
+      v._selected = true
+      downloading.delete(v.id)
+    }
+  })
+  renderPlaylist()
+  checkFailedItems()
+  $('.context-menu').classList.add('hidden')
+  if (videoList.some(v => v._selected !== false)) {
+    $('#downloadBtn').disabled = false
+  }
+}
+
+async function startDownload() {
+  const selected = videoList.filter(v => v._selected !== false && !v._failed)
+  const dir = $('#pathDisplay').textContent
+  const { format, preset } = getFormatAndPreset()
+
+  if (!dir || dir === 'Choose download folder...') {
+    showError('Please select a download folder')
+    return
+  }
+
+  if (selected.length === 0) {
+    showError('No videos selected')
+    return
+  }
+
+  hideError()
+  $('#downloadBtn').disabled = true
+  $('#downloadBtn').classList.add('hidden')
+  $('#cancelBtn').classList.remove('hidden')
+  $('#retryFailedBtn').classList.add('hidden')
+  $('#progressContainer').classList.remove('hidden')
+  $('#progressBar').style.width = '0%'
+  $('#progressPercent').textContent = '0%'
+  $('#progressLabel').textContent = 'Starting...'
+  $('#etaInfo').classList.add('hidden')
+
+  const progressCleanup = API.onProgress((data) => {
+    handleProgress(data)
+  })
+
+  downloading.clear()
+  activeCount = 0
+  completedBytes = 0
+  totalVideos = selected.length
+  const startedAt = Date.now()
+  let completed = 0
+  let failedCount = 0
+
+  function updateETA() {
+    const elapsed = (Date.now() - startedAt) / 1000
+    if (completed > 0 && elapsed > 3) {
+      const perItem = elapsed / completed
+      const remaining = totalVideos - completed
+      const etaSec = Math.round(perItem * remaining)
+      if (etaSec > 0) {
+        const m = Math.floor(etaSec / 60)
+        const s = etaSec % 60
+        $('#etaInfo').classList.remove('hidden')
+        $('#etaText').textContent = `ETA ${m}m ${s}s`
       }
     }
   }
 
-  const workerCount = Math.min(maxConc, items.length)
-  const workers = []
-  for (let i = 0; i < workerCount; i++) {
-    workers.push(worker())
-  }
-  await Promise.all(workers)
-
-  finishDownload()
-}
-
-async function cancelOneDownload(v) {
-  if (!v || v.status !== 'downloading') return
-  await window.api.cancelOne(v.id)
-  v.status = 'cancelled'
-  activeDownloads.delete(v.id)
-  updateVideoItem(v.index)
-}
-
-async function cancelAllDownloads() {
-  await window.api.cancelAll()
-  for (const v of videos) {
-    if (v.status === 'downloading') v.status = 'cancelled'
-  }
-  activeDownloads.clear()
-  isDownloading = false
-  downloadBtn.classList.remove('hidden')
-  cancelBtn.classList.add('hidden')
-  statusText.textContent = 'Cancelled'
-  progressLabel.textContent = 'Downloads cancelled'
-  etaInfo.classList.add('hidden')
-  renderList()
-
-  if (removeProgressListener) {
-    removeProgressListener()
-    removeProgressListener = null
-  }
-  updateDownloadBtn()
-}
-
-function updateEta(completed, total, times) {
-  if (completed <= 0 || times.length === 0) {
-    etaInfo.classList.add('hidden')
-    return
-  }
-  const remaining = total - completed
-  if (remaining <= 0) {
-    etaInfo.classList.add('hidden')
-    return
-  }
-  const avg = times.reduce((a, b) => a + b, 0) / times.length
-  const estMs = avg * remaining
-  const estSec = Math.round(estMs / 1000)
-  let text
-  if (estSec >= 60) {
-    text = `ETA ~${Math.round(estSec / 60)}m ${estSec % 60}s`
-  } else {
-    text = `ETA ~${estSec}s`
-  }
-  etaText.textContent = text
-  etaInfo.classList.remove('hidden')
-}
-
-function finishDownload() {
-  isDownloading = false
-  downloadBtn.classList.remove('hidden')
-  cancelBtn.classList.add('hidden')
-  etaInfo.classList.add('hidden')
-
-  const done = videos.filter(v => v.status === 'done').length
-  const failed = videos.filter(v => v.status === 'error').length
-  downloadStats.totalVideos = (downloadStats.totalVideos || 0) + done
-  downloadStats.sessionDownloads = (downloadStats.sessionDownloads || 0) + done
-  downloadStats.sessionCount = (downloadStats.sessionCount || 0) + 1
-  saveConfig({ downloadStats })
-
-  if (failed === 0) {
-    statusText.textContent = 'All done!'
-    progressLabel.textContent = `Saved to: ${selectedDir}`
-    window.api.notify('VidSaver', `All ${done} downloads complete!`)
-  } else {
-    statusText.textContent = `${done} done, ${failed} failed`
-    progressLabel.textContent = 'Some downloads failed'
-    window.api.notify('VidSaver', `${done} downloaded, ${failed} failed`)
-  }
-
-  setTimeout(() => {
-    progressContainer.classList.add('hidden')
-    statusText.textContent = ''
-  }, 8000)
-
-  if (removeProgressListener) {
-    removeProgressListener()
-    removeProgressListener = null
-  }
-  updateDownloadBtn()
-}
-
-// --- Auto-updater ---
-async function checkForUpdate() {
-  try {
-    const data = await window.api.checkUpdate()
-    if (!data || !data.version) return
-    const current = 'v1.1.0'
-    if (data.version.replace(/^v/i, '') > current.replace(/^v/i, '')) {
-      updateText.textContent = `New version ${data.version} available!`
-      updateLink.href = data.url
-      updateLink.textContent = 'Download'
-      updateBanner.classList.remove('hidden')
+  function onVideoDone(videoId, success) {
+    completed++
+    if (!success) {
+      failedCount++
+      const v = videoList.find(x => x.id === videoId)
+      if (v) v._failed = true
     }
-  } catch {}
+    const status = success ? 'done' : 'error'
+    const d = downloading.get(videoId)
+    if (d) d.status = status
+
+    activeCount--
+
+    renderPlaylist()
+    checkFailedItems()
+    updateETA()
+    updateOverallProgress()
+
+    if (activeCount <= 0 && completed >= totalVideos) {
+      finishDownload(progressCleanup, failedCount, startedAt)
+    }
+  }
+
+  function finishDownload(cleanup, failed, started) {
+    cleanup()
+    $('#downloadBtn').disabled = false
+    $('#downloadBtn').classList.remove('hidden')
+    $('#cancelBtn').classList.add('hidden')
+
+    if (failed === 0) {
+      $('#progressLabel').textContent = 'All downloads complete!'
+      $('#progressPercent').textContent = '100%'
+      $('#progressBar').style.width = '100%'
+      if (totalVideos > 0) {
+        API.notify('VidSaver', `Downloaded ${totalVideos} video${totalVideos > 1 ? 's' : ''} successfully!`)
+      }
+    } else {
+      $('#progressLabel').textContent = `${totalVideos - failed} completed, ${failed} failed`
+      checkFailedItems()
+      API.notify('VidSaver', `${totalVideos - failed} of ${totalVideos} downloaded (${failed} failed)`)
+    }
+
+    checkQueueState()
+  }
+
+  async function worker() {
+    while (queue.length > 0) {
+      const videoId = queue.shift()
+      if (!videoId) break
+
+      const v = videoList.find(x => x.id === videoId)
+      if (!v || v._selected === false) continue
+
+      const entry = { status: 'downloading', percent: 0 }
+      downloading.set(videoId, entry)
+      activeCount++
+      renderPlaylist()
+
+      const url = `https://www.youtube.com/watch?v=${videoId}`
+      try {
+        const result = await API.download(url, dir, format, preset, videoId)
+        onVideoDone(videoId, result.success)
+      } catch (err) {
+        const d = downloading.get(videoId)
+        if (d && d.paused) {
+          d.status = 'paused'
+          renderPlaylist()
+        }
+        onVideoDone(videoId, false)
+      }
+    }
+  }
+
+  queue = selected.map(v => v.id)
+  const workers = Math.min(3, selected.length)
+  for (let i = 0; i < workers; i++) {
+    worker()
+  }
 }
 
-updateDismiss.addEventListener('click', () => {
-  updateBanner.classList.add('hidden')
-})
+function handleProgress(data) {
+  const d = downloading.get(data.videoId)
+  if (!d) return
+  if (d.paused) return
 
-// --- Stats dialog ---
-statsBtn.addEventListener('click', () => {
-  updateStatsDisplay()
-  statsDialog.classList.remove('hidden')
-})
+  d.status = 'downloading'
+  d.percent = data.percent || 0
+  d.speed = data.speed
+  d.eta = data.eta
+  d.downloaded = data.downloaded
+  d.total = data.total
 
-statsCloseBtn.addEventListener('click', () => {
-  statsDialog.classList.add('hidden')
-})
-
-statsDialog.addEventListener('click', (e) => {
-  if (e.target === statsDialog) statsDialog.classList.add('hidden')
-})
-
-// --- Keyboard shortcuts ---
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    if (!presetDialog.classList.contains('hidden')) presetDialog.classList.add('hidden')
-    if (!statsDialog.classList.contains('hidden')) statsDialog.classList.add('hidden')
-    if (!contextMenu.classList.contains('hidden')) contextMenu.classList.add('hidden')
-    return
-  }
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-    e.preventDefault()
-    fetchVideos()
-    return
-  }
-  if ((e.ctrlKey || e.metaKey) && e.key === 'd') {
-    e.preventDefault()
-    if (!downloadBtn.disabled) startDownload()
-    return
-  }
-  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
-    e.preventDefault()
-    searchInput.focus()
-    searchInput.select()
-    return
-  }
-})
-
-// --- Cancel-one button styling ---
-const styleSheet = document.createElement('style')
-styleSheet.textContent = `
-  .cancel-one-btn {
-    background: none;
-    border: none;
-    color: var(--danger);
-    font-size: 16px;
-    cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 4px;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .cancel-one-btn:hover {
-    background: rgba(239,68,68,0.15);
-  }
-`
-document.head.appendChild(styleSheet)
-
-// --- Error ---
-function setError(msg) {
-  errorBar.textContent = msg
-  errorBar.classList.toggle('hidden', !msg)
+  completedBytes += data.deltaBytes || 0
+  updateSizeEstimate()
+  updateOverallProgress()
+  renderPlaylist()
 }
 
-// --- Init ---
-loadConfig()
-setTimeout(checkForUpdate, 3000)
+function updateOverallProgress() {
+  const total = totalVideos || 1
+  let totalPercent = 0
+  downloading.forEach(d => {
+    if (d.status === 'done') totalPercent += 100
+    else if (d.status === 'downloading') totalPercent += (d.percent || 0)
+  })
+  const avg = Math.min(100, Math.round(totalPercent / total))
+  $('#progressBar').style.width = avg + '%'
+  $('#progressPercent').textContent = avg + '%'
+
+  const active = [...downloading.values()].filter(d => d.status === 'downloading').length
+  if (active > 0) {
+    const speeds = [...downloading.values()].filter(d => d.speed).map(d => d.speed)
+    if (speeds.length > 0) {
+      const totalSpeed = speeds.reduce((a, b) => a + b, 0)
+      const speedStr = formatBytes(totalSpeed) + '/s'
+      $('#progressLabel').textContent = `Downloading ${active} file${active > 1 ? 's' : ''} (${speedStr})`
+    } else {
+      $('#progressLabel').textContent = `Downloading ${active} file${active > 1 ? 's' : ''}...`
+    }
+  } else {
+    $('#progressLabel').textContent = 'Processing...'
+  }
+}
+
+function cancelAll() {
+  queue = []
+  API.cancelAll()
+  downloading.forEach((d, id) => {
+    d.status = 'idle'
+  })
+  downloading.clear()
+  activeCount = 0
+  $('#progressContainer').classList.add('hidden')
+  $('#downloadBtn').disabled = false
+  $('#downloadBtn').classList.remove('hidden')
+  $('#cancelBtn').classList.add('hidden')
+  videoList.forEach(v => { v._failed = false })
+  renderPlaylist()
+}
+
+async function doCancelOne(videoId) {
+  const result = await API.cancelOne(videoId)
+  if (result) {
+    const d = downloading.get(videoId)
+    if (d) {
+      d.status = 'idle'
+      activeCount = Math.max(0, activeCount - 1)
+    }
+    downloading.delete(videoId)
+    queue = queue.filter(id => id !== videoId)
+    renderPlaylist()
+    checkQueueState()
+  }
+}
+
+async function pauseDownload(videoId) {
+  await API.pauseOne(videoId)
+  const d = downloading.get(videoId)
+  if (d) {
+    d.paused = true
+    d.status = 'paused'
+  }
+  const v = videoList.find(x => x.id === videoId)
+  if (v) {
+    v._failed = false
+  }
+  queue = queue.filter(id => id !== videoId)
+  checkFailedItems()
+  renderPlaylist()
+}
+
+async function resumeDownload(videoId) {
+  const v = videoList.find(x => x.id === videoId)
+  if (!v) return
+  const dir = $('#pathDisplay').textContent
+  const { format, preset } = getFormatAndPreset()
+
+  const url = `https://www.youtube.com/watch?v=${videoId}`
+
+  const entry = { status: 'downloading', percent: 0, paused: false }
+  downloading.set(videoId, entry)
+  activeCount++
+  renderPlaylist()
+
+  try {
+    const result = await API.download(url, dir, format, preset, videoId)
+    if (result.success) {
+      entry.status = 'done'
+      v._failed = false
+      downloading.delete(videoId)
+    } else {
+      entry.status = 'error'
+      v._failed = true
+    }
+  } catch {
+    entry.status = 'error'
+    v._failed = true
+  }
+
+  activeCount--
+  renderPlaylist()
+  checkFailedItems()
+  checkQueueState()
+}
+
+function checkQueueState() {
+  const hasActive = [...downloading.values()].some(d => d.status === 'downloading' || d.status === 'paused')
+  if (!hasActive && queue.length === 0) {
+    $('#progressContainer').classList.add('hidden')
+    $('#downloadBtn').disabled = false
+    $('#downloadBtn').classList.remove('hidden')
+    $('#cancelBtn').classList.add('hidden')
+  }
+}
+
+function addDragListeners(item, videoId) {
+  item.draggable = true
+}

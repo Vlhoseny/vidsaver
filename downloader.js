@@ -75,7 +75,7 @@ async function runYtDlp(args) {
 }
 
 async function fetchVideoInfo(url) {
-  const args = ['--flat-playlist', '--dump-json', '--no-warnings', '--ignore-errors', '--socket-timeout', '30', '--extractor-retries', '2', url]
+  const args = ['--flat-playlist', '--dump-json', '--no-warnings', '--ignore-errors', '--socket-timeout', '30', '--extractor-retries', '3', url]
   const { stdout, stderr } = await runYtDlp(args)
   const items = parseJsonLines(stdout)
   if (items.length === 0) {
@@ -95,19 +95,49 @@ async function fetchVideoDetails(videoId) {
   return parsed[0]
 }
 
-async function downloadVideo(url, outputDir, type, preset, videoId, onProgress, subs) {
+function extractAvailableQualities(formats, type) {
+  if (!formats || !Array.isArray(formats)) return null
+  if (type === 'mp3') {
+    const abrs = new Set()
+    for (const f of formats) {
+      if (f.vcodec === 'none' && f.abr) abrs.add(Math.round(f.abr))
+    }
+    const sorted = [...abrs].sort((a, b) => b - a)
+    if (sorted.length === 0) return null
+    return sorted.map(abr => ({
+      label: abr >= 320 ? '320kbps' : abr >= 256 ? '256kbps' : abr >= 192 ? '192kbps' : abr >= 160 ? '160kbps' : abr >= 128 ? '128kbps' : abr >= 96 ? '96kbps' : abr >= 70 ? '70kbps' : `${abr}kbps`,
+      quality: String(Math.max(0, 10 - Math.round(abr / 32))),
+      height: null,
+      abr,
+    }))
+  }
+  const heights = new Set()
+  for (const f of formats) {
+    if (f.vcodec && f.vcodec !== 'none' && f.height) heights.add(f.height)
+  }
+  const sorted = [...heights].sort((a, b) => b - a)
+  if (sorted.length === 0) return null
+  const labels = {
+    2160: '2160p (4K)', 1440: '1440p (2K)', 1080: '1080p (Full HD)',
+    720: '720p (HD)', 480: '480p (SD)', 360: '360p', 240: '240p', 144: '144p',
+  }
+  return sorted.map(h => ({
+    label: labels[h] || `${h}p`,
+    height: h,
+    quality: null,
+  }))
+}
+
+async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) {
   const id = ++downloadIdCounter
   return new Promise((resolve, reject) => {
     const fmt = getFormatString(type, preset)
     const template = path.join(outputDir, '%(title)s.%(ext)s')
     const args = [
       '--newline', '--no-warnings', '--no-playlist', '--continue',
-      '--socket-timeout', '30', '--extractor-retries', '2',
+      '--socket-timeout', '30', '--extractor-retries', '3',
       '-f', fmt, '-o', template,
     ]
-    if (subs) {
-      args.push('--write-subs', '--sub-langs', 'en', '--embed-subs')
-    }
     if (type === 'mp3') {
       args.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', preset.quality || '0')
     }
@@ -118,7 +148,8 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress, 
     args.push(url)
 
     const proc = require('child_process').spawn('yt-dlp', args, { windowsHide: true })
-    activeProcesses.set(videoId || id, proc)
+    const key = videoId || id
+    activeProcesses.set(key, { proc, paused: false })
 
     let stderrBuf = ''
     const onStdout = (data) => {
@@ -127,14 +158,31 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress, 
         if (p) onProgress?.({ ...p, videoId })
       }
     }
-    const onStderr = (data) => { stderrBuf += data.toString() }
+    const onStderr = (data) => {
+      stderrBuf += data.toString()
+      for (const line of data.toString().split('\n')) {
+        const p = parseProgressLine(line)
+        if (p) onProgress?.({ ...p, videoId })
+      }
+    }
     proc.stdout.on('data', onStdout)
     proc.stderr.on('data', onStderr)
-    proc.on('error', (err) => { activeProcesses.delete(videoId || id); reject(err) })
+    proc.on('error', (err) => { activeProcesses.delete(key); reject(err) })
     proc.on('close', (code) => {
-      activeProcesses.delete(videoId || id)
-      if (code === 0) { onProgress?.({ percent: 100, videoId }); resolve({ success: true }) }
-      else if (code === null) reject(new Error('Download cancelled'))
+      if (code === 0) {
+        activeProcesses.delete(key)
+        onProgress?.({ percent: 100, videoId })
+        resolve({ success: true })
+        return
+      }
+      const entry = activeProcesses.get(key)
+      if (entry && entry.paused) {
+        activeProcesses.delete(key)
+        reject(new Error('Download paused'))
+        return
+      }
+      activeProcesses.delete(key)
+      if (code === null) reject(new Error('Download cancelled'))
       else {
         const errMsg = stderrBuf.trim().slice(0, 500)
         reject(new Error(errMsg || `yt-dlp exited with code ${code}`))
@@ -144,20 +192,30 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress, 
 }
 
 function cancelOne(videoId) {
-  const proc = activeProcesses.get(videoId)
-  if (proc) {
-    try { proc.kill('SIGTERM') } catch {}
+  const entry = activeProcesses.get(videoId)
+  if (entry) {
+    try { entry.proc.kill('SIGTERM') } catch {}
     activeProcesses.delete(videoId)
     return true
   }
   return false
 }
 
+function pauseOne(videoId) {
+  const entry = activeProcesses.get(videoId)
+  if (entry) {
+    entry.paused = true
+    try { entry.proc.kill('SIGTERM') } catch {}
+    return true
+  }
+  return false
+}
+
 function cancelAll() {
-  for (const [key, proc] of activeProcesses) {
-    try { proc.kill('SIGTERM') } catch {}
+  for (const [key, entry] of activeProcesses) {
+    try { entry.proc.kill('SIGTERM') } catch {}
     activeProcesses.delete(key)
   }
 }
 
-module.exports = { fetchVideoInfo, fetchVideoDetails, downloadVideo, cancelOne, cancelAll }
+module.exports = { fetchVideoInfo, fetchVideoDetails, extractAvailableQualities, downloadVideo, cancelOne, pauseOne, cancelAll }

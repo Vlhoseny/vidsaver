@@ -18,6 +18,9 @@ function load() {
     if (fs.existsSync(configFile)) {
       cache = JSON.parse(fs.readFileSync(configFile, 'utf8'))
     }
+    if (!cache.defaultDir) {
+      cache.defaultDir = path.join(app.getPath('downloads'), 'VidSaver')
+    }
   } catch {}
   return cache
 }
