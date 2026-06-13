@@ -95,7 +95,7 @@ async function fetchVideoDetails(videoId) {
   return parsed[0]
 }
 
-async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) {
+async function downloadVideo(url, outputDir, type, preset, videoId, onProgress, subs) {
   const id = ++downloadIdCounter
   return new Promise((resolve, reject) => {
     const fmt = getFormatString(type, preset)
@@ -105,6 +105,9 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
       '--socket-timeout', '30', '--extractor-retries', '2',
       '-f', fmt, '-o', template,
     ]
+    if (subs) {
+      args.push('--write-subs', '--sub-langs', 'en', '--embed-subs')
+    }
     if (type === 'mp3') {
       args.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', preset.quality || '0')
     }
@@ -115,7 +118,7 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
     args.push(url)
 
     const proc = require('child_process').spawn('yt-dlp', args, { windowsHide: true })
-    activeProcesses.set(id, proc)
+    activeProcesses.set(videoId || id, proc)
 
     let stderrBuf = ''
     const onStdout = (data) => {
@@ -127,9 +130,9 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
     const onStderr = (data) => { stderrBuf += data.toString() }
     proc.stdout.on('data', onStdout)
     proc.stderr.on('data', onStderr)
-    proc.on('error', (err) => { activeProcesses.delete(id); reject(err) })
+    proc.on('error', (err) => { activeProcesses.delete(videoId || id); reject(err) })
     proc.on('close', (code) => {
-      activeProcesses.delete(id)
+      activeProcesses.delete(videoId || id)
       if (code === 0) { onProgress?.({ percent: 100, videoId }); resolve({ success: true }) }
       else if (code === null) reject(new Error('Download cancelled'))
       else {
@@ -140,11 +143,21 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
   })
 }
 
-function cancelAll() {
-  for (const [id, proc] of activeProcesses) {
+function cancelOne(videoId) {
+  const proc = activeProcesses.get(videoId)
+  if (proc) {
     try { proc.kill('SIGTERM') } catch {}
-    activeProcesses.delete(id)
+    activeProcesses.delete(videoId)
+    return true
+  }
+  return false
+}
+
+function cancelAll() {
+  for (const [key, proc] of activeProcesses) {
+    try { proc.kill('SIGTERM') } catch {}
+    activeProcesses.delete(key)
   }
 }
 
-module.exports = { fetchVideoInfo, fetchVideoDetails, downloadVideo, cancelAll }
+module.exports = { fetchVideoInfo, fetchVideoDetails, downloadVideo, cancelOne, cancelAll }
