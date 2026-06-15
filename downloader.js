@@ -3,6 +3,7 @@ const { getFormatString } = require('./shared/formats')
 
 let activeProcesses = new Map()
 let downloadIdCounter = 0
+const cancelledDownloads = new Set()
 
 function getFfmpegPath() {
   try {
@@ -184,6 +185,12 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
     proc.stderr.on('data', onStderr)
     proc.on('error', (err) => { activeProcesses.delete(key); reject(err) })
     proc.on('close', (code) => {
+      if (cancelledDownloads.has(key)) {
+        cancelledDownloads.delete(key)
+        activeProcesses.delete(key)
+        reject(new Error('CANCELLED'))
+        return
+      }
       if (code === 0) {
         activeProcesses.delete(key)
         onProgress?.({ percent: 100, videoId })
@@ -209,8 +216,8 @@ async function downloadVideo(url, outputDir, type, preset, videoId, onProgress) 
 function cancelOne(videoId) {
   const entry = activeProcesses.get(videoId)
   if (entry) {
+    cancelledDownloads.add(videoId)
     try { entry.proc.kill('SIGTERM') } catch {}
-    activeProcesses.delete(videoId)
     return true
   }
   return false
@@ -227,10 +234,11 @@ function pauseOne(videoId) {
 }
 
 function cancelAll() {
-  for (const [key, entry] of activeProcesses) {
-    try { entry.proc.kill('SIGTERM') } catch {}
-    activeProcesses.delete(key)
+  for (const [key] of activeProcesses) {
+    cancelledDownloads.add(key)
+    try { activeProcesses.get(key)?.proc.kill('SIGTERM') } catch {}
   }
+  activeProcesses.clear()
 }
 
 module.exports = { fetchVideoInfo, fetchVideoDetails, extractAvailableQualities, downloadVideo, cancelOne, pauseOne, cancelAll }

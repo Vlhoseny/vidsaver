@@ -1,6 +1,6 @@
 {
   "name": "vidsaver",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Download YouTube playlists and videos with ease",
   "main": "main.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "build:mac": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=darwin --arch=x64 --out=dist --overwrite --icon=renderer/icon.png",
     "build:linux": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=linux --arch=x64 --out=dist --overwrite --icon=renderer/icon.png",
     "build": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=win32 --arch=x64 --out=dist --overwrite --icon=renderer/icon.ico --asar.unpackDir=\"node_modules/@ffmpeg-installer\"",
-    "build:portable": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=win32 --arch=x64 --out=dist --overwrite --icon=renderer/icon.ico --asar.unpackDir=\"node_modules/@ffmpeg-installer\" && powershell -Command \"Compress-Archive -Path 'dist\\VidSaver-win32-x64\\*' -DestinationPath 'dist\\VidSaver-1.2.0-portable.zip' -Force\"",
+    "build:portable": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=win32 --arch=x64 --out=dist --overwrite --icon=renderer/icon.ico --asar.unpackDir=\"node_modules/@ffmpeg-installer\" && powershell -Command \"Compress-Archive -Path 'dist\\VidSaver-win32-x64\\*' -DestinationPath 'dist\\VidSaver-1.3.0-portable.zip' -Force\"",
     "build:all": "node node_modules/@electron/packager/bin/electron-packager.mjs . VidSaver --platform=all --arch=all --out=dist --overwrite --icon=renderer/icon --asar.unpackDir=\"node_modules/@ffmpeg-installer\""
   },
   "author": "VidSaver",

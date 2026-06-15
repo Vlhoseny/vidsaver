@@ -3,6 +3,9 @@ const $$ = (s) => document.querySelectorAll(s)
 
 let videoList = []
 let downloading = new Map()
+let currentSession = 0
+let progressCleanup = null
+const cancelledIds = new Set()
 let activeCount = 0
 let totalVideos = 0
 let totalBytes = 0
@@ -757,6 +760,10 @@ async function startDownload() {
   }
 
   hideError()
+  if (typeof progressCleanup === 'function') progressCleanup()
+  currentSession++
+  const session = currentSession
+
   $('#downloadBtn').disabled = true
   $('#downloadBtn').classList.add('hidden')
   $('#cancelBtn').classList.remove('hidden')
@@ -767,7 +774,8 @@ async function startDownload() {
   $('#progressLabel').textContent = 'Starting...'
   $('#etaInfo').classList.add('hidden')
 
-  const progressCleanup = API.onProgress((data) => {
+  progressCleanup = API.onProgress((data) => {
+    if (session !== currentSession) return
     handleProgress(data)
   })
 
@@ -795,6 +803,8 @@ async function startDownload() {
   }
 
   function onVideoDone(videoId, success) {
+    if (session !== currentSession) return
+    if (cancelledIds.has(videoId)) return
     completed++
     if (!success) {
       failedCount++
@@ -805,7 +815,7 @@ async function startDownload() {
     const d = downloading.get(videoId)
     if (d) d.status = status
 
-    activeCount--
+    activeCount = Math.max(0, activeCount - 1)
 
     renderPlaylist()
     checkFailedItems()
@@ -813,12 +823,13 @@ async function startDownload() {
     updateOverallProgress()
 
     if (activeCount <= 0 && completed >= totalVideos) {
-      finishDownload(progressCleanup, failedCount, startedAt)
+      finishDownload(failedCount, startedAt)
     }
   }
 
-  function finishDownload(cleanup, failed, started) {
-    cleanup()
+  function finishDownload(failed, started) {
+    progressCleanup()
+    progressCleanup = null
     $('#downloadBtn').disabled = false
     $('#downloadBtn').classList.remove('hidden')
     $('#cancelBtn').classList.add('hidden')
@@ -845,7 +856,10 @@ async function startDownload() {
       if (!videoId) break
 
       const v = videoList.find(x => x.id === videoId)
-      if (!v || v._selected === false) continue
+      if (!v || v._selected === false) {
+        completed++
+        continue
+      }
 
       const entry = { status: 'downloading', percent: 0 }
       downloading.set(videoId, entry)
@@ -855,8 +869,15 @@ async function startDownload() {
       const url = `https://www.youtube.com/watch?v=${videoId}`
       try {
         const result = await API.download(url, dir, format, preset, videoId)
+        if (session !== currentSession) return
         onVideoDone(videoId, result.success)
       } catch (err) {
+        if (session !== currentSession) return
+        if (err.message === 'CANCELLED') {
+          completed++
+          activeCount = Math.max(0, activeCount - 1)
+          continue
+        }
         const d = downloading.get(videoId)
         if (d && d.paused) {
           d.status = 'paused'
@@ -918,14 +939,16 @@ function updateOverallProgress() {
   }
 }
 
-function cancelAll() {
+async function cancelAll() {
+  currentSession++
+  if (typeof progressCleanup === 'function') progressCleanup()
+  progressCleanup = null
+  await API.cancelAll()
   queue = []
-  API.cancelAll()
-  downloading.forEach((d, id) => {
-    d.status = 'idle'
-  })
   downloading.clear()
   activeCount = 0
+  completedBytes = 0
+  totalVideos = 0
   $('#progressContainer').classList.add('hidden')
   $('#downloadBtn').disabled = false
   $('#downloadBtn').classList.remove('hidden')
@@ -935,18 +958,15 @@ function cancelAll() {
 }
 
 async function doCancelOne(videoId) {
-  const result = await API.cancelOne(videoId)
-  if (result) {
-    const d = downloading.get(videoId)
-    if (d) {
-      d.status = 'idle'
-      activeCount = Math.max(0, activeCount - 1)
-    }
-    downloading.delete(videoId)
-    queue = queue.filter(id => id !== videoId)
-    renderPlaylist()
-    checkQueueState()
-  }
+  await API.cancelOne(videoId)
+  if (cancelledIds.has(videoId)) return
+  cancelledIds.add(videoId)
+  const d = downloading.get(videoId)
+  if (d) d.status = 'cancelled'
+  downloading.delete(videoId)
+  queue = queue.filter(id => id !== videoId)
+  renderPlaylist()
+  checkQueueState()
 }
 
 async function pauseDownload(videoId) {
